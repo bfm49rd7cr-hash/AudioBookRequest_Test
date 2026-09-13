@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import posixpath
 import re
 import time
@@ -11,7 +12,7 @@ from typing import Literal
 
 from aiohttp import ClientSession
 from pydantic import BaseModel, TypeAdapter
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 from sqlmodel import Session
 
 from app.internal.audiobookshelf.config import abs_config
@@ -28,6 +29,7 @@ from app.util.log import logger
 # Keep the ABS snapshot fresh enough for availability checks without fetching the
 # full library for every user search.
 _ABS_LIBRARY_CACHE_TTL_SECONDS = 5 * 60
+_ABS_LIBRARY_RETRY_BACKOFF_SECONDS = 30
 
 # These are common edition/format qualifiers that may be appended to the title
 # by one metadata source but omitted by another. They are only accepted when all
@@ -71,6 +73,33 @@ _TITLE_QUALIFIER_PREFIXES = (
     "vollstaendig",
 )
 
+_DISTINGUISHING_SEQUENCE_TOKENS = frozenset(
+    {
+        *(str(number) for number in range(1, 101)),
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eins",
+        "zwei",
+        "drei",
+        "vier",
+        "funf",
+        "fuenf",
+        "sechs",
+        "sieben",
+        "acht",
+        "neun",
+        "zehn",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _IndexedABSBook:
@@ -85,11 +114,12 @@ class _IndexedABSBook:
 
 @dataclass(slots=True)
 class _ABSLibraryIndex:
-    key: tuple[str, str, int]
+    key: tuple[str, str, str]
     fetched_at: float
     items: list[_IndexedABSBook]
     by_asin: dict[str, _IndexedABSBook]
     by_title: dict[str, list[_IndexedABSBook]]
+    fuzzy_titles: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,11 +134,7 @@ class _ABSMatch:
 
 _abs_library_index: _ABSLibraryIndex | None = None
 _abs_library_index_lock = asyncio.Lock()
-
-
-def _invalidate_abs_library_index() -> None:
-    global _abs_library_index
-    _abs_library_index = None
+_abs_library_refresh_failure: tuple[tuple[str, str, str], float] | None = None
 
 
 def _headers(session: Session) -> dict[str, str]:
@@ -157,7 +183,6 @@ async def abs_trigger_scan(session: Session, client_session: ClientSession) -> b
                 "ABS: failed to trigger scan", status=resp.status, reason=resp.reason
             )
             return False
-        _invalidate_abs_library_index()
         return True
 
 
@@ -241,10 +266,7 @@ async def abs_list_library_items(
             # Cover: ABS exposes cover via /api/items/:id/cover
             cover_image = posixpath.join(base_url, f"api/items/{item.id}/cover")
             # Duration in seconds -> minutes
-            try:
-                runtime_length_min = int(round(item.media.duration / 60))
-            except Exception:
-                runtime_length_min = 0
+            runtime_length_min = round((item.media.duration or 0.0) / 60)
 
             if metadata.publishedDate:
                 try:
@@ -295,7 +317,9 @@ def _normalize_text(value: str | None) -> str:
         return ""
 
     # casefold handles Unicode case rules better than lower(), including ß -> ss.
-    normalized = value.casefold()
+    normalized = value.casefold().translate(
+        str.maketrans({"'": "", "’": "", "æ": "ae", "ø": "o", "ł": "l", "œ": "oe"})
+    )
     # Remove combining marks so ö/o or é/e differences do not cause false misses.
     normalized = unicodedata.normalize("NFKD", normalized)
     normalized = "".join(char for char in normalized if not unicodedata.combining(char))
@@ -326,35 +350,48 @@ def _title_variants(
     return tuple(sorted(variants))
 
 
-def _titles_differ_only_by_qualifiers(left: str, right: str) -> bool:
-    left_tokens = set(left.split())
-    right_tokens = set(right.split())
-    if not left_tokens or not right_tokens or left_tokens == right_tokens:
-        return False
-
-    if left_tokens < right_tokens:
-        extra_tokens = right_tokens - left_tokens
-    elif right_tokens < left_tokens:
-        extra_tokens = left_tokens - right_tokens
-    else:
-        return False
-
-    return bool(extra_tokens) and all(
-        token in _TITLE_QUALIFIER_TOKENS or token.startswith(_TITLE_QUALIFIER_PREFIXES)
-        for token in extra_tokens
+def _is_title_qualifier(token: str) -> bool:
+    return token in _TITLE_QUALIFIER_TOKENS or token.startswith(
+        _TITLE_QUALIFIER_PREFIXES
     )
 
 
-def _cache_key(session: Session) -> tuple[str, str, int] | None:
+def _strip_trailing_title_qualifiers(title: str) -> str:
+    tokens = title.split()
+    while len(tokens) > 1 and _is_title_qualifier(tokens[-1]):
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _title_lookup_keys(title: str) -> tuple[str, ...]:
+    stripped = _strip_trailing_title_qualifiers(title)
+    return (title,) if stripped == title else (title, stripped)
+
+
+def _titles_differ_only_by_qualifiers(left: str, right: str) -> bool:
+    return left != right and (
+        _strip_trailing_title_qualifiers(left) == right
+        or _strip_trailing_title_qualifiers(right) == left
+    )
+
+
+def _sequence_tokens(title: str) -> frozenset[str]:
+    return frozenset(
+        token for token in title.split() if token in _DISTINGUISHING_SEQUENCE_TOKENS
+    )
+
+
+def _cache_key(session: Session) -> tuple[str, str, str] | None:
     base_url = abs_config.get_base_url(session)
     library_id = abs_config.get_library_id(session)
     token = abs_config.get_api_token(session)
     if not base_url or not library_id or not token:
         return None
 
-    # Include a token-derived value because ABS permissions can change the visible
-    # library contents even when the base URL and library ID stay the same.
-    return base_url, library_id, hash(token)
+    # A non-reversible token fingerprint prevents a permission/account change from
+    # reusing a snapshot without retaining the secret itself in the cache key.
+    token_fingerprint = hashlib.sha256(token.encode()).hexdigest()[:16]
+    return base_url, library_id, token_fingerprint
 
 
 async def _fetch_abs_library_index_items(
@@ -402,7 +439,7 @@ async def _fetch_abs_library_index_items(
 
 
 def _build_abs_library_index(
-    key: tuple[str, str, int],
+    key: tuple[str, str, str],
     items: list[ABSBookItemMinified],
 ) -> _ABSLibraryIndex:
     indexed_items: list[_IndexedABSBook] = []
@@ -435,7 +472,8 @@ def _build_abs_library_index(
             by_asin.setdefault(normalized_asin, indexed)
 
         for title in title_variants:
-            by_title.setdefault(title, []).append(indexed)
+            for lookup_key in _title_lookup_keys(title):
+                by_title.setdefault(lookup_key, []).append(indexed)
 
     return _ABSLibraryIndex(
         key=key,
@@ -443,6 +481,7 @@ def _build_abs_library_index(
         items=indexed_items,
         by_asin=by_asin,
         by_title=by_title,
+        fuzzy_titles=tuple(by_title),
     )
 
 
@@ -450,7 +489,7 @@ async def _get_abs_library_index(
     session: Session,
     client_session: ClientSession,
 ) -> _ABSLibraryIndex | None:
-    global _abs_library_index
+    global _abs_library_index, _abs_library_refresh_failure
 
     key = _cache_key(session)
     if key is None:
@@ -464,6 +503,12 @@ async def _get_abs_library_index(
         and now - cached.fetched_at < _ABS_LIBRARY_CACHE_TTL_SECONDS
     ):
         return cached
+    if (
+        _abs_library_refresh_failure is not None
+        and _abs_library_refresh_failure[0] == key
+        and now - _abs_library_refresh_failure[1] < _ABS_LIBRARY_RETRY_BACKOFF_SECONDS
+    ):
+        return cached if cached is not None and cached.key == key else None
 
     # A lock prevents concurrent searches from all fetching the full ABS library
     # when the cache expires at the same time.
@@ -476,19 +521,29 @@ async def _get_abs_library_index(
             and now - cached.fetched_at < _ABS_LIBRARY_CACHE_TTL_SECONDS
         ):
             return cached
+        if (
+            _abs_library_refresh_failure is not None
+            and _abs_library_refresh_failure[0] == key
+            and now - _abs_library_refresh_failure[1]
+            < _ABS_LIBRARY_RETRY_BACKOFF_SECONDS
+        ):
+            return cached if cached is not None and cached.key == key else None
 
         items = await _fetch_abs_library_index_items(session, client_session)
         if items is None:
+            _abs_library_refresh_failure = (key, now)
             # A stale known-good snapshot is safer than turning a temporary ABS
             # outage into duplicate request buttons for already-owned books.
             if cached is not None and cached.key == key:
                 logger.warning(
                     "ABS: keeping stale library index after refresh failure",
                     cache_age_seconds=round(now - cached.fetched_at),
+                    retry_after_seconds=_ABS_LIBRARY_RETRY_BACKOFF_SECONDS,
                 )
                 return cached
             return None
 
+        _abs_library_refresh_failure = None
         _abs_library_index = _build_abs_library_index(key, items)
         logger.info(
             "ABS: library index refreshed",
@@ -510,7 +565,7 @@ def _person_score(
     candidates = [name for name in (candidate_name, candidate_name_lf) if name]
     return max(
         (
-            fuzz.token_set_ratio(_normalize_text(name), candidate)
+            fuzz.token_sort_ratio(_normalize_text(name), candidate)
             for name in names
             for candidate in candidates
         ),
@@ -544,11 +599,11 @@ def _title_score(
                 book_title, item_title
             ):
                 return 100.0
-            best_score = max(
-                best_score,
-                fuzz.ratio(book_title, item_title),
-                fuzz.token_sort_ratio(book_title, item_title),
-            )
+            # Volume/part numbers distinguish adjacent books in the same series;
+            # fuzzy similarity must never erase that difference.
+            if _sequence_tokens(book_title) != _sequence_tokens(item_title):
+                continue
+            best_score = max(best_score, fuzz.ratio(book_title, item_title))
 
     return best_score
 
@@ -581,24 +636,13 @@ def _find_abs_match(
     if not book_titles:
         return None
 
-    # Exact normalized titles are cheap to look up. Require supporting metadata
-    # so common titles from different authors do not become false positives.
+    # Exact normalized and qualifier-stripped titles are cheap indexed lookups.
+    # Supporting metadata is still required so common titles do not collide.
     exact_candidates: dict[str, _IndexedABSBook] = {}
     for title in book_titles:
-        for item in index.by_title.get(title, []):
-            exact_candidates[item.item_id] = item
-
-    # Treat a title that only adds known edition/format qualifiers as an exact
-    # metadata candidate. It still requires the author (or independent
-    # supporting metadata) below, so it cannot turn a similar series title into
-    # a match.
-    for item in index.items:
-        if any(
-            _titles_differ_only_by_qualifiers(book_title, item_title)
-            for book_title in book_titles
-            for item_title in item.title_variants
-        ):
-            exact_candidates[item.item_id] = item
+        for lookup_key in _title_lookup_keys(title):
+            for item in index.by_title.get(lookup_key, []):
+                exact_candidates[item.item_id] = item
 
     for item in exact_candidates.values():
         title_score, author_score, narrator_score, duration_close = _metadata_scores(
@@ -608,7 +652,7 @@ def _find_abs_match(
             item.author_name or item.author_name_lf
         )
         if (has_author_evidence and author_score >= 90) or (
-            not has_author_evidence and (narrator_score >= 90 or duration_close)
+            not has_author_evidence and narrator_score >= 95 and duration_close
         ):
             return _ABSMatch(
                 item_id=item.item_id,
@@ -619,10 +663,23 @@ def _find_abs_match(
                 duration_close=duration_close,
             )
 
-    # Fuzzy matching is intentionally conservative. It only compensates for
-    # small metadata differences; title similarity by itself is never enough.
+    # RapidFuzz finds a bounded candidate set in native code. Detailed matching
+    # then runs only for those candidates instead of scanning every library item
+    # in Python for every Audible result.
+    fuzzy_candidates: dict[str, _IndexedABSBook] = {}
+    for book_title in book_titles:
+        for matched_title, _, _ in process.extract(
+            book_title,
+            index.fuzzy_titles,
+            scorer=fuzz.ratio,
+            score_cutoff=88,
+            limit=25,
+        ):
+            for item in index.by_title[matched_title]:
+                fuzzy_candidates[item.item_id] = item
+
     best_scores = (0.0, 0.0, 0.0, False)
-    for item in index.items:
+    for item in fuzzy_candidates.values():
         title_score, author_score, narrator_score, duration_close = _metadata_scores(
             book, item, book_titles
         )
@@ -634,7 +691,7 @@ def _find_abs_match(
                 duration_close,
             )
 
-        if title_score >= 93 and author_score >= 90:
+        if title_score >= 95 and author_score >= 92:
             return _ABSMatch(
                 item_id=item.item_id,
                 method="fuzzy_metadata",
@@ -645,9 +702,10 @@ def _find_abs_match(
             )
 
         if (
-            title_score >= 88
+            title_score >= 90
             and author_score >= 95
-            and (narrator_score >= 90 or duration_close)
+            and narrator_score >= 92
+            and duration_close
         ):
             return _ABSMatch(
                 item_id=item.item_id,
@@ -670,6 +728,16 @@ def _find_abs_match(
     return None
 
 
+def _find_abs_matches(
+    index: _ABSLibraryIndex, books: list[Audiobook]
+) -> list[tuple[Audiobook, _ABSMatch]]:
+    matches: list[tuple[Audiobook, _ABSMatch]] = []
+    for book in books:
+        if match := _find_abs_match(index, book):
+            matches.append((book, match))
+    return matches
+
+
 async def abs_book_exists(
     session: Session,
     client_session: ClientSession,
@@ -685,7 +753,7 @@ async def abs_book_exists(
         )
         return False
 
-    match = _find_abs_match(index, book)
+    match = await asyncio.to_thread(_find_abs_match, index, book)
     if match is None:
         return False
 
@@ -707,26 +775,18 @@ async def abs_mark_downloaded_flags(
     client_session: ClientSession,
     books: list[Audiobook],
 ) -> None:
-    if not abs_config.get_check_downloaded(session):
+    if not books or not abs_config.get_check_downloaded(session):
         return
 
     # Fetch/refresh the ABS snapshot once. All following checks are local and do
     # not generate one or two ABS API searches per Audible result.
     index = await _get_abs_library_index(session, client_session)
     if index is None:
-        # Preserve the existing behavior where merged Audible metadata is
-        # committed while ABS checking is enabled, even if ABS is unavailable.
-        session.commit()
         return
 
-    for book in books:
-        if book.downloaded:
-            continue
-
-        match = _find_abs_match(index, book)
-        if match is None:
-            continue
-
+    to_match = [book for book in books if not book.downloaded]
+    matches = await asyncio.to_thread(_find_abs_matches, index, to_match)
+    for book, match in matches:
         logger.debug(
             "ABS: marking existing book as downloaded",
             asin=book.asin,
@@ -739,5 +799,3 @@ async def abs_mark_downloaded_flags(
         )
         book.downloaded = True
         session.add(book)
-
-    session.commit()

@@ -58,6 +58,7 @@ async def search_books(
 
     # Check the cached ABS library snapshot for existing books.
     await abs_mark_downloaded_flags(session, client_session, merged)
+    session.commit()
 
     return [
         AudiobookWithRequests(
