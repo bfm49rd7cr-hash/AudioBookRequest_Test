@@ -2,17 +2,16 @@
 FROM alpine:3.23 AS css
 WORKDIR /app
 
-RUN apk add --no-cache curl build-base && \
-    ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-    TAILWIND_ARCH="x64"; \
-    elif [ "$ARCH" = "aarch64" ]; then \
-    TAILWIND_ARCH="arm64"; \
-    else \
-    echo "Unsupported architecture: $ARCH" && exit 1; \
-    fi && \
-    curl -L "https://github.com/tailwindlabs/tailwindcss/releases/download/v4.1.18/tailwindcss-linux-${TAILWIND_ARCH}-musl" \
-    -o /bin/tailwindcss && \
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates curl
+RUN case "${TARGETARCH:-$(uname -m)}" in \
+    amd64|x86_64) TAILWIND_ARCH="x64" ;; \
+    arm64|aarch64) TAILWIND_ARCH="arm64" ;; \
+    *) echo "Unsupported architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
+    esac && \
+    curl --fail --location --retry 3 \
+    "https://github.com/tailwindlabs/tailwindcss/releases/download/v4.1.18/tailwindcss-linux-${TAILWIND_ARCH}-musl" \
+    --output /bin/tailwindcss && \
     chmod +x /bin/tailwindcss
 
 RUN mkdir -p static && \
