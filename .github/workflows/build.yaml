@@ -54,6 +54,9 @@ jobs:
       - name: Check if Jinjax parameters are defined
         run: just test_jinja
 
+      - name: Run unit tests
+        run: uv run python -m unittest discover -s tests -p "test_*.py" -v
+
       - run: echo "$PWD/.venv/bin" >> $GITHUB_PATH
 
       - name: Check SQLite Alembic Migrations

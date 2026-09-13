@@ -44,13 +44,21 @@ async def search_books(
     else:
         results = []
 
-    # refreshes the "requests"
+    # Refresh Audible metadata without resetting an existing positive download
+    # state. Fresh Audible models default to downloaded=False, so a plain
+    # session.merge() can otherwise undo an earlier ABS/manual detection.
     merged: list[Audiobook] = []
     for res in results:
-        merged.append(session.merge(res))
+        existing = session.get(Audiobook, res.asin)
+        was_downloaded = existing.downloaded if existing else False
+        merged_book = session.merge(res)
+        if was_downloaded:
+            merged_book.downloaded = True
+        merged.append(merged_book)
 
-    # Check ABS for existing books and mark as downloaded if found
+    # Check the cached ABS library snapshot for existing books.
     await abs_mark_downloaded_flags(session, client_session, merged)
+    session.commit()
 
     return [
         AudiobookWithRequests(

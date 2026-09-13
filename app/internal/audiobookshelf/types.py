@@ -10,14 +10,18 @@ class ABSLibrary(BaseModel):
 
 
 class ABSBookMinified(BaseModel):
-    id: str
-    duration: float
+    # Current ABS minified responses do not consistently include a media-level
+    # id. The library-item id is the stable identifier used by ABR.
+    id: str | None = None
+    duration: float | None = None
 
     class _Metadata(BaseModel):
         title: str | None = None
+        titleIgnorePrefix: str | None = None
         subtitle: str | None = None
-        authorName: str
-        narratorName: str
+        authorName: str | None = None
+        authorNameLF: str | None = None
+        narratorName: str | None = None
         publishedDate: str | None = None
         asin: str | None = None
 
